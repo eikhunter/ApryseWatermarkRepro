@@ -1,0 +1,499 @@
+diff --git a/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.h b/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.h
+index 795e97e..4b75efc 100644
+--- a/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.h
++++ b/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.h
+@@ -7,7 +7,9 @@ NS_ASSUME_NONNULL_BEGIN
+ @class RNTPTDocumentController;
+ 
+ @protocol RNTPTDocumentControllerDelegate <PTDocumentControllerDelegate, RNTPTDocumentBaseViewControllerDelegate>
+-@required
++@optional
++
++- (void)rnt_documentViewControllerStreamingStarted:(PTDocumentBaseViewController *)documentViewController;
+ 
+ @end
+ 
+diff --git a/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.m b/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.m
+index 7f7250f..6f8d90f 100644
+--- a/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.m
++++ b/node_modules/@pdftron/react-native-pdf/ios/DocumentViewController/RNTPTDocumentController.m
+@@ -10,6 +10,7 @@ @interface RNTPTDocumentController ()
+ @property (nonatomic) BOOL needsDocumentLoaded;
+ @property (nonatomic) BOOL needsRemoteDocumentLoaded;
+ @property (nonatomic) BOOL documentLoaded;
++@property (nonatomic) BOOL streamingReproNotified;
+ 
+ @end
+ 
+@@ -52,6 +53,7 @@ - (void)openDocumentWithURL:(NSURL *)url password:(NSString *)password
+     self.documentLoaded = NO;
+     self.needsDocumentLoaded = NO;
+     self.needsRemoteDocumentLoaded = NO;
++    self.streamingReproNotified = NO;
+     
+     [super openDocumentWithURL:url password:password];
+ }
+@@ -217,6 +219,16 @@ - (void)pdfViewCtrl:(PTPDFViewCtrl *)pdfViewCtrl onSetDoc:(PTPDFDoc *)doc
+ {
+     [super pdfViewCtrl:pdfViewCtrl onSetDoc:doc];
+ 
++    if (!self.local && !self.streamingReproNotified) {
++        self.streamingReproNotified = YES;
++        if ([self.delegate respondsToSelector:@selector(rnt_documentViewControllerStreamingStarted:)]) {
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
++                           dispatch_get_main_queue(), ^{
++                [self.delegate rnt_documentViewControllerStreamingStarted:self];
++            });
++        }
++    }
++    
+     if (self.local && !self.documentLoaded) {
+         self.needsDocumentLoaded = YES;
+     }
+diff --git a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.h b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.h
+index 438383d..216447e 100644
+--- a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.h
++++ b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.h
+@@ -487,6 +487,9 @@ static NSString * const PTSignaturesManager_signatureDirectory = @"PTSignaturesM
+ @property (nonatomic, strong, nullable) PTCollaborationManager *collaborationManager;
+ 
+ @property (nonatomic, copy, nullable) RCTBubblingEventBlock onChange;
++@property (nonatomic, copy, nullable) RCTBubblingEventBlock onReproLog;
++@property (nonatomic, copy, nullable) RCTBubblingEventBlock onWatermarkResult;
++@property (nonatomic, copy, nullable) NSDictionary *watermarkConfig;
+ 
+ @property (nonatomic, weak, nullable) id <RNTPTDocumentViewDelegate> delegate;
+ 
+diff --git a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.m b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.m
+index c2d63ad..0c8aa9c 100644
+--- a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.m
++++ b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentView.m
+@@ -28,6 +28,9 @@ @interface RNTPTDocumentView () <PTTabbedDocumentViewControllerDelegate, RNTPTDo
+ {
+     NSMutableDictionary<NSString *, NSNumber *> *_annotationToolbarItemKeyMap;
+     NSUInteger _annotationToolbarItemCounter;
++    NSDictionary *_watermarkConfig;
++    BOOL _watermarkStamped;
++    NSURL *_reproDocumentCacheDirectoryURL;
+ }
+ 
+ @property (nonatomic, strong, nullable) UIViewController *viewController;
+@@ -135,6 +138,8 @@ - (void)RNTPTDocumentView_commonInit
+     _autoSaveEnabled = YES;
+     
+     _pageChangeOnTap = NO;
++    _watermarkConfig = nil;
++    _watermarkStamped = NO;
+     _thumbnailViewEditingEnabled = YES;
+     _selectAnnotationAfterCreation = YES;
+     _autoResizeFreeTextEnabled = YES;
+@@ -257,6 +262,13 @@ - (void)openDocument
+     }
+     options.password = self.password;
+ 
++    if (_reproDocumentCacheDirectoryURL && self.documentViewController) {
++        self.documentViewController.documentManager.documentCacheDirectoryURL =
++            _reproDocumentCacheDirectoryURL;
++        NSLog(@"[PTStamperRepro] cold cache directory=%@",
++              _reproDocumentCacheDirectoryURL.path);
++    }
++
+     if (self.documentViewController) {
+         [self.documentViewController openDocumentWithURL:fileURL
+                                                  options:options];
+@@ -270,6 +282,7 @@ - (void)openDocument
+ 
+ - (void)setDocument:(NSString *)document
+ {
++    _watermarkStamped = NO;
+     if([document length] != 0){
+         _document = [document copy];
+     }
+@@ -280,6 +293,7 @@ - (void)setDocument:(NSString *)document
+ 
+ - (void)setSource:(NSString *)source
+ {
++    _watermarkStamped = NO;
+     _document = [source copy];
+     
+     [self openDocument];
+@@ -3051,12 +3065,26 @@ - (void)setSaveStateEnabled:(BOOL)enabled
+     [self applyViewerSettings];
+ }
+ 
+-- (void)setOpenUrlCachePath:(NSString *)openUrlCachePath
++- (void)setOpenUrlPath:(NSString *)openUrlPath
+ {
+-    NSURL *cacheDirectoryURL = [NSURL fileURLWithPath:openUrlCachePath isDirectory:YES];
++    _openUrlPath = [openUrlPath copy];
++    NSURL *cacheDirectoryURL;
++    if ([openUrlPath isEqualToString:@"__fresh_repro_cache__"]) {
++        NSString *path = [NSTemporaryDirectory()
++            stringByAppendingPathComponent:
++                [NSString stringWithFormat:@"ApryseWatermarkRepro/%@",
++                    NSUUID.UUID.UUIDString]];
++        cacheDirectoryURL = [NSURL fileURLWithPath:path isDirectory:YES];
++    } else {
++        cacheDirectoryURL = [NSURL fileURLWithPath:openUrlPath isDirectory:YES];
++    }
+     
+     if ([NSFileManager.defaultManager createDirectoryAtURL:cacheDirectoryURL withIntermediateDirectories:YES attributes:nil error:nil]) {
+-        self.documentViewController.documentManager.documentCacheDirectoryURL = cacheDirectoryURL;
++        _reproDocumentCacheDirectoryURL = cacheDirectoryURL;
++        if (self.documentViewController) {
++            self.documentViewController.documentManager.documentCacheDirectoryURL =
++                cacheDirectoryURL;
++        }
+     }
+ }
+ 
+@@ -3568,6 +3596,266 @@ - (BOOL)toolManager:(PTToolManager *)toolManager shouldHandleLinkAnnotation:(PTA
+ 
+ #pragma mark - <RNTPTDocumentViewControllerDelegate>
+ 
++- (void)setWatermarkConfig:(nullable NSDictionary *)config
++{
++    if (config) {
++        _watermarkConfig = [config copy];
++    }
++}
++
++- (void)emitWatermarkResult:(BOOL)success
++                     reason:(nullable NSString *)reason
++                  pageCount:(int)pageCount
++                 lockWaitMs:(double)lockWaitMs
++                    stampMs:(double)stampMs
++                    totalMs:(double)totalMs
++{
++    NSLog(@"[PTStamperRepro] result success=%d pages=%d lockWaitMs=%.1f stampMs=%.1f totalMs=%.1f reason=%@",
++          success, pageCount, lockWaitMs, stampMs, totalMs, reason ?: @"");
++    if (self.onWatermarkResult) {
++        self.onWatermarkResult(@{
++            @"success": @(success),
++            @"reason": reason ?: @"",
++            @"pageCount": @(pageCount),
++            @"lockWaitMs": @(round(lockWaitMs)),
++            @"stampMs": @(round(stampMs)),
++            @"totalMs": @(round(totalMs)),
++        });
++    }
++}
++
++- (void)emitReproInfo:(NSString *)message elapsedMs:(double)elapsedMs
++{
++    NSLog(@"[PTStamperRepro] INFO %@ elapsedMs=%.1f", message, elapsedMs);
++    if (self.onReproLog) {
++        self.onReproLog(@{
++            @"level": @"info",
++            @"message": message,
++            @"elapsedMs": @(round(elapsedMs)),
++        });
++    }
++}
++
++- (UIImage *)syntheticWatermarkTileForLines:(NSArray<NSString *> *)lines
++                                       size:(CGSize)size
++                                    opacity:(double)opacity
++{
++    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
++    format.scale = 2.0;
++    format.opaque = NO;
++    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
++        initWithSize:size format:format];
++    NSString *text = [lines componentsJoinedByString:@"\n"];
++    NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
++    paragraphStyle.alignment = NSTextAlignmentCenter;
++
++    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
++        NSDictionary *attributes = @{
++            NSFontAttributeName: [UIFont boldSystemFontOfSize:16.0],
++            NSForegroundColorAttributeName:
++                [[UIColor colorWithRed:0.72 green:0.05 blue:0.08 alpha:1.0]
++                    colorWithAlphaComponent:opacity],
++            NSParagraphStyleAttributeName: paragraphStyle,
++        };
++        [text drawInRect:CGRectInset((CGRect){CGPointZero, size}, 4.0, 4.0)
++          withAttributes:attributes];
++    }];
++}
++
++- (UIImage *)tiledCompositeFromTile:(UIImage *)tile
++                            tileSize:(CGSize)tileSize
++                           pageWidth:(CGFloat)pageWidth
++                          pageHeight:(CGFloat)pageHeight
++{
++    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
++    format.scale = 2.0;
++    format.opaque = NO;
++    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
++        initWithSize:CGSizeMake(pageWidth, pageHeight) format:format];
++
++    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
++        CGContextRef cg = context.CGContext;
++        CGFloat angle = (CGFloat)(-50.0 * M_PI / 180.0);
++        CGFloat diagonal = (CGFloat)sqrt(pageWidth * pageWidth + pageHeight * pageHeight);
++        NSInteger count = (NSInteger)(diagonal / MIN(tileSize.width, tileSize.height)) + 4;
++
++        CGContextTranslateCTM(cg, pageWidth / 2.0, pageHeight / 2.0);
++        CGContextRotateCTM(cg, angle);
++        CGContextTranslateCTM(cg, -pageWidth / 2.0, -pageHeight / 2.0);
++        for (NSInteger row = -count; row <= count; row++) {
++            for (NSInteger column = -count; column <= count; column++) {
++                CGRect destination = CGRectMake(
++                    pageWidth / 2.0 + column * tileSize.width - tileSize.width / 2.0,
++                    pageHeight / 2.0 + row * tileSize.height - tileSize.height / 2.0,
++                    tileSize.width,
++                    tileSize.height);
++                [tile drawInRect:destination];
++            }
++        }
++    }];
++}
++
++- (BOOL)stampTiledImageWithLines:(NSArray<NSString *> *)lines
++                         opacity:(double)opacity
++                        tileSize:(CGSize)tileSize
++                           onDoc:(PTPDFDoc *)doc
++                           pages:(PTPageSet *)pages
++{
++    PTPDFRect *cropBox = [[doc GetPage:1] GetCropBox];
++    CGFloat pageWidth = (CGFloat)([cropBox GetX2] - [cropBox GetX1]);
++    CGFloat pageHeight = (CGFloat)([cropBox GetY2] - [cropBox GetY1]);
++    if (pageWidth < 1.0 || pageHeight < 1.0) {
++        return NO;
++    }
++
++    UIImage *tile = [self syntheticWatermarkTileForLines:lines
++                                                    size:tileSize
++                                                 opacity:opacity];
++    UIImage *composite = [self tiledCompositeFromTile:tile
++                                             tileSize:tileSize
++                                            pageWidth:pageWidth
++                                           pageHeight:pageHeight];
++    NSData *pngData = UIImagePNGRepresentation(composite);
++    PTSDFDoc *sdfDoc = [doc GetSDFDoc];
++    if (!pngData || !sdfDoc) {
++        return NO;
++    }
++
++    PTImage *image = [PTImage CreateWithDataSimple:sdfDoc
++                                               buf:pngData
++                                          buf_size:(unsigned long)pngData.length
++                                     encoder_hints:nil];
++    if (!image) {
++        return NO;
++    }
++
++    PTStamper *stamper = [[PTStamper alloc]
++        initWithSize_type:e_ptabsolute_size a:pageWidth b:pageHeight];
++    [stamper SetAlignment:e_pthorizontal_center
++       vertical_alignment:e_ptvertical_center];
++    [stamper SetPosition:0 vertical_distance:0 use_percentage:YES];
++    [stamper SetOpacity:1.0];
++    [stamper SetAsBackground:NO];
++    [stamper SetAsAnnotation:NO];
++    [stamper StampImage:doc src_img:image dest_pages:pages];
++    return YES;
++}
++
++- (void)applyReproWatermarkToPdfViewCtrl:(PTPDFViewCtrl *)pdfViewCtrl
++{
++    if (_watermarkStamped) {
++        return;
++    }
++
++    NSArray *lines = [_watermarkConfig[@"lines"] isKindOfClass:[NSArray class]]
++        ? _watermarkConfig[@"lines"] : nil;
++    if (lines.count == 0) {
++        [self emitWatermarkResult:NO reason:@"watermark-config-missing"
++                       pageCount:0 lockWaitMs:0 stampMs:0 totalMs:0];
++        return;
++    }
++
++    NSString *text = [lines componentsJoinedByString:@"\n"];
++    double opacity = _watermarkConfig[@"opacity"]
++        ? [_watermarkConfig[@"opacity"] doubleValue] : 0.18;
++    BOOL useTiledImage = [_watermarkConfig[@"mode"] isEqualToString:@"tiledImage"];
++    CGFloat tileWidth = _watermarkConfig[@"tileWidth"]
++        ? [_watermarkConfig[@"tileWidth"] doubleValue] : 240.0;
++    CGFloat tileHeight = _watermarkConfig[@"tileHeight"]
++        ? [_watermarkConfig[@"tileHeight"] doubleValue] : 96.0;
++    CFAbsoluteTime requestedAt = CFAbsoluteTimeGetCurrent();
++    __block CFAbsoluteTime lockAcquiredAt = requestedAt;
++    __block CFAbsoluteTime stampFinishedAt = requestedAt;
++    __block int pageCount = 0;
++    __block BOOL stamped = NO;
++    NSError *lockError = nil;
++
++    NSLog(@"[PTStamperRepro] stamp requested");
++    [self emitReproInfo:@"PTStamper requested" elapsedMs:0];
++    @try {
++        [pdfViewCtrl DocLock:NO withBlock:^(PTPDFDoc * _Nullable doc) {
++            lockAcquiredAt = CFAbsoluteTimeGetCurrent();
++            if (!doc) {
++                return;
++            }
++
++            pageCount = [doc GetPageCount];
++            NSLog(@"[PTStamperRepro] write lock acquired waitMs=%.1f pages=%d",
++                  (lockAcquiredAt - requestedAt) * 1000.0, pageCount);
++            [self emitReproInfo:
++                [NSString stringWithFormat:@"write lock acquired; pages=%d", pageCount]
++                         elapsedMs:(lockAcquiredAt - requestedAt) * 1000.0];
++            if (pageCount <= 0) {
++                return;
++            }
++
++            PTPageSet *allPages = [[PTPageSet alloc]
++                initWithRange_start:1 range_end:pageCount filter:e_ptall];
++            if (useTiledImage) {
++                stamped = [self stampTiledImageWithLines:lines
++                                                opacity:opacity
++                                               tileSize:CGSizeMake(tileWidth, tileHeight)
++                                                  onDoc:doc
++                                                  pages:allPages];
++            } else {
++                PTStamper *stamper = [[PTStamper alloc]
++                    initWithSize_type:e_pts_font_size a:25.0 b:0.0];
++                [stamper SetTextAlignment:(PTTextAlignment)0];
++                [stamper SetPosition:0 vertical_distance:0 use_percentage:YES];
++                [stamper SetOpacity:opacity];
++                [stamper SetAsBackground:NO];
++                [stamper SetAsAnnotation:NO];
++                [stamper SetRotation:-50.0];
++                [stamper SetAlignment:e_pthorizontal_center
++                    vertical_alignment:e_ptvertical_center];
++                [stamper StampText:doc src_txt:text dest_pages:allPages];
++                stamped = YES;
++            }
++            stampFinishedAt = CFAbsoluteTimeGetCurrent();
++            NSLog(@"[PTStamperRepro] %@ complete stampMs=%.1f",
++                  useTiledImage ? @"StampImage" : @"StampText",
++                  (stampFinishedAt - lockAcquiredAt) * 1000.0);
++            [self emitReproInfo:
++                useTiledImage ? @"tiled StampImage complete" : @"StampText complete"
++                      elapsedMs:(stampFinishedAt - lockAcquiredAt) * 1000.0];
++            [pdfViewCtrl Update:YES];
++        } error:&lockError];
++    }
++    @catch (NSException *exception) {
++        NSString *reason = [NSString stringWithFormat:@"%@: %@",
++                            exception.name, exception.reason ?: @""];
++        [self emitWatermarkResult:NO reason:reason pageCount:pageCount
++                       lockWaitMs:(lockAcquiredAt - requestedAt) * 1000.0
++                          stampMs:0
++                          totalMs:(CFAbsoluteTimeGetCurrent() - requestedAt) * 1000.0];
++        return;
++    }
++
++    CFAbsoluteTime completedAt = CFAbsoluteTimeGetCurrent();
++    if (!stamped || lockError) {
++        [self emitWatermarkResult:NO
++                           reason:lockError.localizedDescription ?: @"stamp-not-applied"
++                        pageCount:pageCount
++                       lockWaitMs:(lockAcquiredAt - requestedAt) * 1000.0
++                          stampMs:0
++                          totalMs:(completedAt - requestedAt) * 1000.0];
++        return;
++    }
++
++    _watermarkStamped = YES;
++    [self emitWatermarkResult:YES reason:nil pageCount:pageCount
++                   lockWaitMs:(lockAcquiredAt - requestedAt) * 1000.0
++                      stampMs:(stampFinishedAt - lockAcquiredAt) * 1000.0
++                      totalMs:(completedAt - requestedAt) * 1000.0];
++}
++
++- (void)rnt_documentViewControllerStreamingStarted:(PTDocumentBaseViewController *)documentViewController
++{
++    [self emitReproInfo:@"first streamed page arrived; downloader remains active"
++              elapsedMs:0];
++    [self applyReproWatermarkToPdfViewCtrl:documentViewController.pdfViewCtrl];
++}
++
+ - (void)rnt_documentViewControllerDocumentLoaded:(PTDocumentBaseViewController *)documentViewController
+ {       
+     if ([self isReadOnly] && ![documentViewController.toolManager isReadonly]) {
+@@ -3581,6 +3869,9 @@ - (void)rnt_documentViewControllerDocumentLoaded:(PTDocumentBaseViewController *
+         [self.tabbedDocumentViewController.tabManager saveItems];
+     }
+ 
++    [self emitReproInfo:@"download finished after streaming watermark attempt"
++              elapsedMs:0];
++    
+     if ([self.delegate respondsToSelector:@selector(documentLoaded:)]) {
+         [self.delegate documentLoaded:self];
+     }
+diff --git a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentViewManager.m b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentViewManager.m
+index 29b9b70..26572a3 100644
+--- a/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentViewManager.m
++++ b/node_modules/@pdftron/react-native-pdf/ios/RNTPTDocumentViewManager.m
+@@ -26,6 +26,13 @@ - (instancetype)init
+ }
+ 
+ RCT_EXPORT_VIEW_PROPERTY(onChange, RCTBubblingEventBlock)
++RCT_EXPORT_VIEW_PROPERTY(onReproLog, RCTBubblingEventBlock)
++RCT_EXPORT_VIEW_PROPERTY(onWatermarkResult, RCTBubblingEventBlock)
++
++RCT_CUSTOM_VIEW_PROPERTY(watermarkConfig, NSDictionary, RNTPTDocumentView)
++{
++    view.watermarkConfig = json ? [RCTConvert NSDictionary:json] : nil;
++}
+ 
+ RCT_CUSTOM_VIEW_PROPERTY(document, NSString, RNTPTDocumentView)
+ {
+diff --git a/node_modules/@pdftron/react-native-pdf/lib/src/DocumentView/DocumentView.js b/node_modules/@pdftron/react-native-pdf/lib/src/DocumentView/DocumentView.js
+index 8efa59c..147ab58 100644
+--- a/node_modules/@pdftron/react-native-pdf/lib/src/DocumentView/DocumentView.js
++++ b/node_modules/@pdftron/react-native-pdf/lib/src/DocumentView/DocumentView.js
+@@ -15,6 +15,15 @@ import { Config } from "../Config/Config";
+ const propTypes = {
+     document: PropTypes.string.isRequired,
+     source: PropTypes.string,
++    watermarkConfig: PropTypes.shape({
++        lines: PropTypes.arrayOf(PropTypes.string.isRequired).isRequired,
++        opacity: PropTypes.number,
++        mode: PropTypes.string,
++        tileWidth: PropTypes.number,
++        tileHeight: PropTypes.number,
++    }),
++    onReproLog: func(),
++    onWatermarkResult: func(),
+     password: PropTypes.string,
+     initialPageNumber: PropTypes.number,
+     page: PropTypes.number,
+diff --git a/node_modules/@pdftron/react-native-pdf/src/DocumentView/DocumentView.tsx b/node_modules/@pdftron/react-native-pdf/src/DocumentView/DocumentView.tsx
+index 4948cad..0e5b24a 100644
+--- a/node_modules/@pdftron/react-native-pdf/src/DocumentView/DocumentView.tsx
++++ b/node_modules/@pdftron/react-native-pdf/src/DocumentView/DocumentView.tsx
+@@ -23,6 +23,30 @@ import * as AnnotOptions from "../AnnotOptions/AnnotOptions";
+ const propTypes = {
+   document: PropTypes.string.isRequired,
+   source: PropTypes.string,
++  watermarkConfig: PropTypes.shape({
++    lines: PropTypes.arrayOf(PropTypes.string.isRequired).isRequired,
++    opacity: PropTypes.number,
++    mode: PropTypes.string,
++    tileWidth: PropTypes.number,
++    tileHeight: PropTypes.number,
++  }),
++  onReproLog: func<(event: {
++    nativeEvent: {
++      level: string,
++      message: string,
++      elapsedMs?: number,
++    }
++  }) => void>(),
++  onWatermarkResult: func<(event: {
++    nativeEvent: {
++      success: boolean,
++      reason?: string,
++      pageCount?: number,
++      lockWaitMs?: number,
++      stampMs?: number,
++      totalMs?: number,
++    }
++  }) => void>(),
+   password: PropTypes.string,
+   initialPageNumber: PropTypes.number,
+   page: PropTypes.number,
